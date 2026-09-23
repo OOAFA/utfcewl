@@ -14,6 +14,7 @@ Supports:
   - Depth-limited crawling with same-domain restriction
   - Configurable min/max word length and frequency filtering
   - Email, metadata, and path extraction
+  - Object-storage bucket-name export for BucketBuster
 """
 
 from __future__ import annotations
@@ -31,10 +32,16 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-import regex
 import requests
 from bs4 import BeautifulSoup
 from urllib3.exceptions import InsecureRequestWarning
+
+try:
+    import regex as _rx
+    HAS_REGEX = True
+except ImportError:
+    _rx = re  # stdlib fallback — CJK classes are approximate
+    HAS_REGEX = False
 
 try:
     import jieba  # Chinese word segmentation
@@ -50,19 +57,28 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 # Constants & patterns
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Script-aware tokenizer: Han (Chinese/Kanji) is segmented via jieba since it has
 # no whitespace between words; Hiragana/Katakana/Hangul/Thai (also unspaced, but
 # with no segmenter available) fall back to per-character tokens; everything else
 # (Latin, Cyrillic, Greek, Arabic, Hebrew, Devanagari, ...) uses generic Unicode
 # letter/digit matching, same shape as the old Latin+Cyrillic-only pattern.
-SCRIPT_SEGMENT_RE = regex.compile(
-    r"(?P<han>\p{Script=Han}+)"
-    r"|(?P<unsegmented>[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]+)"
-    r"|(?P<general>[\p{L}\p{N}][\p{L}\p{N}'’\-]*[\p{L}\p{N}]|[\p{L}\p{N}])",
-    regex.UNICODE,
-)
+if HAS_REGEX:
+    SCRIPT_SEGMENT_RE = _rx.compile(
+        r"(?P<han>\p{Script=Han}+)"
+        r"|(?P<unsegmented>[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]+)"
+        r"|(?P<general>[\p{L}\p{N}][\p{L}\p{N}'’\-]*[\p{L}\p{N}]|[\p{L}\p{N}])",
+        _rx.UNICODE,
+    )
+else:
+    # Approximate script classes so the tool still runs without the `regex` package
+    SCRIPT_SEGMENT_RE = re.compile(
+        r"(?P<han>[\u4e00-\u9fff]+)"
+        r"|(?P<unsegmented>[\u3040-\u30ff\uac00-\ud7af\u0e00-\u0e7f]+)"
+        r"|(?P<general>[\w][\w'’\-]*[\w]|[\w])",
+        re.UNICODE,
+    )
 
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
@@ -159,6 +175,73 @@ def extract_words_from_text(
 
 def extract_emails(text: str) -> Set[str]:
     return set(EMAIL_RE.findall(text or ""))
+
+
+# Object-storage names are short DNS labels: compact tokens, no spaces.
+# Keep this conservative so 30 students do not spray 10k raw CeWL words.
+BUCKET_TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]+", re.UNICODE)
+DEFAULT_BUCKET_LIMIT = 400
+DEFAULT_BUCKET_MIN = 3
+DEFAULT_BUCKET_MAX = 40
+
+
+def slurp_wordlist_lines(path: str) -> List[str]:
+    """Read a utfcewl / hashcat-style list. Drops comments; strips ,count."""
+    out: List[str] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            out.append(line.split(",", 1)[0].strip())
+    return out
+
+
+def bucket_variants(
+    word: str,
+    min_len: int = DEFAULT_BUCKET_MIN,
+    max_len: int = DEFAULT_BUCKET_MAX,
+) -> Set[str]:
+    """Turn one harvested token into bucket-shaped candidates."""
+    word = word.strip().lower()
+    if not word:
+        return set()
+    found = {word.replace(" ", "-"), word.replace(" ", "")}
+    compact = "".join(BUCKET_TOKEN_RE.findall(word))
+    if compact:
+        found.add(compact)
+        found.add(compact.replace("ё", "е"))
+        # IDNA-ish ASCII fallback already covered by --translit in the crawl
+    return {w for w in found if min_len <= len(w) <= max_len and " " not in w}
+
+
+def build_bucket_names(
+    words: Iterable[str],
+    extra: Iterable[str] = (),
+    limit: int = DEFAULT_BUCKET_LIMIT,
+    min_len: int = DEFAULT_BUCKET_MIN,
+    max_len: int = DEFAULT_BUCKET_MAX,
+) -> List[str]:
+    """Deduplicate, keep first-seen order (frequency-sorted input wins)."""
+    names: List[str] = []
+    seen: Set[str] = set()
+    for word in list(words) + list(extra):
+        if not word:
+            continue
+        for item in bucket_variants(word, min_len=min_len, max_len=max_len):
+            if item not in seen:
+                seen.add(item)
+                names.append(item)
+                if limit and len(names) >= limit:
+                    return names
+    return names
+
+
+def write_bucket_names(path: str, names: List[str]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        if names:
+            fh.write("\n".join(names) + "\n")
+    logging.getLogger("utfcewl").info("Wrote %d bucket names to %s", len(names), path)
 
 
 def get_base_domain(url: str) -> str:
@@ -529,12 +612,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   utfcewl https://example.ru -d 2 -m 4 -o words.txt
-  utfcewl https://company.ru --translit --emails -o russian_words.txt
+  utfcewl https://company.ru --translit --emails --buckets -o russian_words.txt
   utfcewl https://target.ru -d 3 -t 12 --min-freq 2 --with-counts -o out.txt
   utfcewl https://site.ru --no-ssl-verify --delay 0.5 -o safe.txt
+  utfcewl --buckets-from words.txt --buckets-paths words.txt.paths \\
+          --buckets-extra superdrones,sd340 -o buckets.txt
         """,
     )
-    p.add_argument("url", help="Starting URL to crawl")
+    p.add_argument("url", nargs="?", default=None,
+                   help="Starting URL to crawl (omit with --buckets-from)")
     p.add_argument("-d", "--depth", type=int, default=2,
                    help="Maximum crawl depth (default: 2)")
     p.add_argument("-m", "--min-word-length", type=int, default=3,
@@ -563,6 +649,36 @@ Examples:
                    help="Also extract and save email addresses")
     p.add_argument("--paths", action="store_true",
                    help="Also extract URL path segments")
+    p.add_argument(
+        "--buckets",
+        action="store_true",
+        help="After a crawl, also write <output>.buckets — short object-store "
+             "name candidates for BucketBuster (words + paths + --buckets-extra)",
+    )
+    p.add_argument(
+        "--buckets-from",
+        default=None,
+        metavar="FILE",
+        help="Skip the crawl. Build a bucket-name list from an existing wordlist "
+             "(plain words or word,count). Writes -o (default: <file>.buckets)",
+    )
+    p.add_argument(
+        "--buckets-paths",
+        default=None,
+        metavar="FILE",
+        help="With --buckets-from, also read this .paths file",
+    )
+    p.add_argument(
+        "--buckets-extra",
+        default="",
+        help="Comma-separated extra tokens to always include (company, product, city)",
+    )
+    p.add_argument(
+        "--buckets-limit",
+        type=int,
+        default=DEFAULT_BUCKET_LIMIT,
+        help=f"Cap on exported bucket names (default: {DEFAULT_BUCKET_LIMIT})",
+    )
     p.add_argument("--no-meta", action="store_true",
                    help="Skip meta tags / Open Graph content")
     p.add_argument("--ua", default=DEFAULT_UA,
@@ -579,6 +695,37 @@ Examples:
     return p
 
 
+def _extra_bucket_tokens(raw: str) -> List[str]:
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def _export_buckets_offline(args: argparse.Namespace) -> int:
+    src = args.buckets_from
+    if not os.path.isfile(src):
+        logging.error("Wordlist not found: %s", src)
+        return 1
+    words = slurp_wordlist_lines(src)
+    paths_file = args.buckets_paths
+    if paths_file:
+        if os.path.isfile(paths_file):
+            words.extend(slurp_wordlist_lines(paths_file))
+        else:
+            logging.warning("Paths file missing, skipping: %s", paths_file)
+    names = build_bucket_names(
+        words,
+        extra=_extra_bucket_tokens(args.buckets_extra),
+        limit=args.buckets_limit,
+        min_len=args.min_word_length,
+        max_len=args.max_word_length,
+    )
+    out = args.output
+    if out == "utfcewl_wordlist.txt":
+        out = src + ".buckets"
+    write_bucket_names(out, names)
+    print(f"wrote {len(names)} names → {out}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -591,6 +738,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         datefmt="%H:%M:%S",
     )
 
+    if args.buckets_from:
+        return _export_buckets_offline(args)
+
+    if not args.url:
+        parser.error("url is required unless --buckets-from is set")
+
     # Headers
     extra_headers: Dict[str, str] = {}
     for h in args.header:
@@ -601,6 +754,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     proxies = None
     if args.proxy:
         proxies = {"http": args.proxy, "https": args.proxy}
+
+    # --buckets needs path tokens even if the student forgot --paths
+    include_paths = args.paths or args.buckets
 
     crawler = UtfCewl(
         start_url=args.url,
@@ -618,7 +774,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         proxies=proxies,
         include_emails=args.emails,
         include_meta=not args.no_meta,
-        include_paths=args.paths,
+        include_paths=include_paths,
         verbose=args.verbose,
     )
 
@@ -637,6 +793,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         with_counts=args.with_counts,
         sort_by=sort_by,
     )
+
+    if args.buckets:
+        words = crawler.get_wordlist(min_freq=args.min_freq, with_counts=False, sort_by=sort_by)
+        words.extend(sorted(crawler.paths))
+        names = build_bucket_names(
+            words,
+            extra=_extra_bucket_tokens(args.buckets_extra),
+            limit=args.buckets_limit,
+            min_len=args.min_word_length,
+            max_len=args.max_word_length,
+        )
+        write_bucket_names(args.output + ".buckets", names)
 
     # Also print a short summary to stdout
     top = crawler.get_wordlist(min_freq=args.min_freq, with_counts=True, sort_by="freq")[:15]
